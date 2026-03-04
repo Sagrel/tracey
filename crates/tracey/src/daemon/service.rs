@@ -12,12 +12,10 @@ use super::engine::Engine;
 use super::watcher::WatcherState;
 use crate::rule_suggestions::suggest_similar_rule_ids;
 use crate::server::QueryEngine;
-use roam::{Context, Tx};
+use roam::Tx;
 
 // Re-export the generated dispatcher from tracey-proto
 pub use tracey_proto::TraceyDaemonDispatcher;
-
-const STALE_IMPLEMENTATION_MUST_CHANGE_PREFIX: &str = "Implementation must be changed to match updated rule text — and ONLY ONCE THAT'S DONE must the code annotation be bumped";
 
 #[derive(Debug, Clone)]
 struct HistoricalRuleText {
@@ -223,7 +221,7 @@ fn arborium_language(path: &str) -> Option<&'static str> {
 /// Implementation of the TraceyDaemon trait.
 impl TraceyDaemon for TraceyService {
     /// Get coverage status for all specs/impls
-    async fn status(&self, _cx: &Context) -> StatusResponse {
+    async fn status(&self) -> StatusResponse {
         let data = self.inner.engine.data().await;
         let query = QueryEngine::new(&data);
         let stats = query.status();
@@ -244,7 +242,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Get uncovered rules
-    async fn uncovered(&self, _cx: &Context, req: UncoveredRequest) -> UncoveredResponse {
+    async fn uncovered(&self, req: UncoveredRequest) -> UncoveredResponse {
         let data = self.inner.engine.data().await;
         let query = QueryEngine::new(&data);
 
@@ -285,7 +283,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Get untested rules
-    async fn untested(&self, _cx: &Context, req: UntestedRequest) -> UntestedResponse {
+    async fn untested(&self, req: UntestedRequest) -> UntestedResponse {
         let data = self.inner.engine.data().await;
         let query = QueryEngine::new(&data);
 
@@ -325,7 +323,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Get stale references
-    async fn stale(&self, _cx: &Context, req: StaleRequest) -> StaleResponse {
+    async fn stale(&self, req: StaleRequest) -> StaleResponse {
         let data = self.inner.engine.data().await;
         let query = QueryEngine::new(&data);
 
@@ -361,7 +359,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Get unmapped code
-    async fn unmapped(&self, _cx: &Context, req: UnmappedRequest) -> UnmappedResponse {
+    async fn unmapped(&self, req: UnmappedRequest) -> UnmappedResponse {
         let data = self.inner.engine.data().await;
         let query = QueryEngine::new(&data);
 
@@ -424,7 +422,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Get details for a specific rule
-    async fn rule(&self, _cx: &Context, rule_id: RuleId) -> Option<RuleInfo> {
+    async fn rule(&self, rule_id: RuleId) -> Option<RuleInfo> {
         let data = self.inner.engine.data().await;
         let query = QueryEngine::new(&data);
 
@@ -467,13 +465,13 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Get current configuration
-    async fn config(&self, _cx: &Context) -> ApiConfig {
+    async fn config(&self) -> ApiConfig {
         let data = self.inner.engine.data().await;
         data.config.clone()
     }
 
     /// VFS: file opened
-    async fn vfs_open(&self, _cx: &Context, path: String, content: String) {
+    async fn vfs_open(&self, path: String, content: String) {
         self.inner
             .engine
             .vfs_open(std::path::PathBuf::from(path), content)
@@ -481,7 +479,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// VFS: file changed
-    async fn vfs_change(&self, _cx: &Context, path: String, content: String) {
+    async fn vfs_change(&self, path: String, content: String) {
         self.inner
             .engine
             .vfs_change(std::path::PathBuf::from(path), content)
@@ -489,7 +487,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// VFS: file closed
-    async fn vfs_close(&self, _cx: &Context, path: String) {
+    async fn vfs_close(&self, path: String) {
         self.inner
             .engine
             .vfs_close(std::path::PathBuf::from(path))
@@ -497,7 +495,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Force a rebuild
-    async fn reload(&self, _cx: &Context) -> ReloadResponse {
+    async fn reload(&self) -> ReloadResponse {
         match self.inner.engine.rebuild().await {
             Ok((version, duration)) => ReloadResponse {
                 version,
@@ -514,12 +512,12 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Get current version
-    async fn version(&self, _cx: &Context) -> u64 {
+    async fn version(&self) -> u64 {
         self.inner.engine.version()
     }
 
     /// Get daemon health status
-    async fn health(&self, _cx: &Context) -> HealthResponse {
+    async fn health(&self) -> HealthResponse {
         let version = self.inner.engine.version();
         let uptime_secs = self.inner.start_time.elapsed().as_secs();
 
@@ -563,13 +561,13 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Request the daemon to shut down gracefully
-    async fn shutdown(&self, _cx: &Context) {
+    async fn shutdown(&self) {
         tracing::info!("Shutdown requested via RPC");
         let _ = self.inner.shutdown_tx.send(true);
     }
 
     /// Subscribe to data updates
-    async fn subscribe(&self, _cx: &Context, updates: Tx<DataUpdate>) {
+    async fn subscribe(&self, updates: Tx<DataUpdate>) {
         // Get a watch receiver from the engine
         let mut rx = self.inner.engine.subscribe();
 
@@ -617,36 +615,26 @@ impl TraceyDaemon for TraceyService {
             }; // Guard dropped here before the await
 
             // Send the update - if this fails, the client disconnected
-            if updates.send(&update).await.is_err() {
+            if updates.send(update).await.is_err() {
                 break;
             }
         }
     }
 
     /// Get forward traceability data
-    async fn forward(
-        &self,
-        _cx: &Context,
-        spec: String,
-        impl_name: String,
-    ) -> Option<ApiSpecForward> {
+    async fn forward(&self, spec: String, impl_name: String) -> Option<ApiSpecForward> {
         let data = self.inner.engine.data().await;
         data.forward_by_impl.get(&(spec, impl_name)).cloned()
     }
 
     /// Get reverse traceability data
-    async fn reverse(
-        &self,
-        _cx: &Context,
-        spec: String,
-        impl_name: String,
-    ) -> Option<ApiReverseData> {
+    async fn reverse(&self, spec: String, impl_name: String) -> Option<ApiReverseData> {
         let data = self.inner.engine.data().await;
         data.reverse_by_impl.get(&(spec, impl_name)).cloned()
     }
 
     /// Get file with syntax highlighting
-    async fn file(&self, _cx: &Context, req: FileRequest) -> Option<ApiFileData> {
+    async fn file(&self, req: FileRequest) -> Option<ApiFileData> {
         let data = self.inner.engine.data().await;
         let project_root = self.inner.engine.project_root();
 
@@ -713,12 +701,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Get rendered spec content
-    async fn spec_content(
-        &self,
-        _cx: &Context,
-        spec: String,
-        impl_name: String,
-    ) -> Option<ApiSpecData> {
+    async fn spec_content(&self, spec: String, impl_name: String) -> Option<ApiSpecData> {
         let data = self.inner.engine.data().await;
         if let Some(cached) = data
             .specs_content_by_impl
@@ -744,7 +727,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Search rules and files
-    async fn search(&self, _cx: &Context, query: String, limit: u32) -> Vec<SearchResult> {
+    async fn search(&self, query: String, limit: u32) -> Vec<SearchResult> {
         let raw_results: Vec<_> = self
             .inner
             .engine
@@ -786,11 +769,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Update a file range
-    async fn update_file_range(
-        &self,
-        _cx: &Context,
-        req: UpdateFileRangeRequest,
-    ) -> Result<(), UpdateError> {
+    async fn update_file_range(&self, req: UpdateFileRangeRequest) -> Result<(), UpdateError> {
         let project_root = self.inner.engine.project_root();
 
         // Resolve the file path
@@ -852,7 +831,7 @@ impl TraceyDaemon for TraceyService {
     }
 
     /// Check if a path is a test file
-    async fn is_test_file(&self, _cx: &Context, path: String) -> bool {
+    async fn is_test_file(&self, path: String) -> bool {
         let data = self.inner.engine.data().await;
         let path = std::path::PathBuf::from(path);
         data.test_files.contains(&path)
@@ -861,7 +840,7 @@ impl TraceyDaemon for TraceyService {
     /// Validate the spec and implementation
     ///
     /// r[impl mcp.validation.check]
-    async fn validate(&self, _cx: &Context, req: ValidateRequest) -> ValidationResult {
+    async fn validate(&self, req: ValidateRequest) -> ValidationResult {
         let data = self.inner.engine.data().await;
         let (spec, impl_name) =
             self.resolve_spec_impl(req.spec.as_deref(), req.impl_name.as_deref(), &data.config);
@@ -885,7 +864,7 @@ impl TraceyDaemon for TraceyService {
     /// Get hover info for a position in a file
     ///
     /// r[impl lsp.hover.prefix]
-    async fn lsp_hover(&self, _cx: &Context, req: LspPositionRequest) -> Option<HoverInfo> {
+    async fn lsp_hover(&self, req: LspPositionRequest) -> Option<HoverInfo> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -982,7 +961,7 @@ impl TraceyDaemon for TraceyService {
     /// Get definition location for a reference at a position
     ///
     /// r[impl lsp.goto.ref-to-def]
-    async fn lsp_definition(&self, _cx: &Context, req: LspPositionRequest) -> Vec<LspLocation> {
+    async fn lsp_definition(&self, req: LspPositionRequest) -> Vec<LspLocation> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -1014,7 +993,7 @@ impl TraceyDaemon for TraceyService {
     /// r[impl lsp.impl.from-def]
     /// r[impl lsp.impl.from-ref]
     /// r[impl lsp.impl.multiple]
-    async fn lsp_implementation(&self, _cx: &Context, req: LspPositionRequest) -> Vec<LspLocation> {
+    async fn lsp_implementation(&self, req: LspPositionRequest) -> Vec<LspLocation> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -1045,7 +1024,7 @@ impl TraceyDaemon for TraceyService {
     /// r[impl lsp.references.from-definition]
     /// r[impl lsp.references.from-reference]
     /// r[impl lsp.references.include-type]
-    async fn lsp_references(&self, _cx: &Context, req: LspReferencesRequest) -> Vec<LspLocation> {
+    async fn lsp_references(&self, req: LspReferencesRequest) -> Vec<LspLocation> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -1108,11 +1087,7 @@ impl TraceyDaemon for TraceyService {
     /// r[impl lsp.completions.verb]
     /// r[impl lsp.completions.req-id]
     /// r[impl lsp.completions.req-id-fuzzy]
-    async fn lsp_completions(
-        &self,
-        _cx: &Context,
-        req: LspPositionRequest,
-    ) -> Vec<LspCompletionItem> {
+    async fn lsp_completions(&self, req: LspPositionRequest) -> Vec<LspCompletionItem> {
         let data = self.inner.engine.data().await;
 
         // Get the text before cursor to determine completion context
@@ -1184,193 +1159,12 @@ impl TraceyDaemon for TraceyService {
         completions
     }
 
-    /// Get diagnostics for a file
+    /// Get diagnostics for all files in the workspace
     ///
     /// r[impl lsp.diagnostics.orphaned]
     /// r[impl lsp.diagnostics.duplicate-definition]
     /// r[impl lsp.diagnostics.impl-in-test]
-    async fn lsp_diagnostics(&self, _cx: &Context, req: LspDocumentRequest) -> Vec<LspDiagnostic> {
-        let data = self.inner.engine.data().await;
-        let path = PathBuf::from(&req.path);
-
-        let mut diagnostics = Vec::new();
-
-        // For markdown spec files, show coverage diagnostics for definitions
-        // and validate inline cross-references like `r[foo.bar]`.
-        if path.extension().is_some_and(|ext| ext == "md") {
-            let options = marq::RenderOptions::default();
-            if let Ok(doc) = marq::render(&req.content, &options).await {
-                for def in &doc.reqs {
-                    // Use marker_span for diagnostics (only squiggle the marker, not content)
-                    let (start_line, start_char, end_line, end_char) =
-                        span_to_range(&req.content, def.marker_span.offset, def.marker_span.length);
-
-                    // Look up the rule to check coverage
-                    if let Some(def_id) = parse_rule_id(&def.id.to_string())
-                        && let Some((_, rule)) = find_rule_in_data(&data, &def_id)
-                    {
-                        let impl_count = rule.impl_refs.len();
-                        let verify_count = rule.verify_refs.len();
-
-                        if impl_count == 0 {
-                            diagnostics.push(LspDiagnostic {
-                                severity: "hint".to_string(),
-                                code: "uncovered".to_string(),
-                                message: "Requirement has no implementations".to_string(),
-                                start_line,
-                                start_char,
-                                end_line,
-                                end_char,
-                            });
-                        } else if verify_count == 0 {
-                            diagnostics.push(LspDiagnostic {
-                                severity: "hint".to_string(),
-                                code: "untested".to_string(),
-                                message: format!(
-                                    "Requirement has {} impl but no verification",
-                                    impl_count
-                                ),
-                                start_line,
-                                start_char,
-                                end_line,
-                                end_char,
-                            });
-                        }
-                    }
-                }
-            }
-
-            let known_prefixes: std::collections::HashSet<_> = data
-                .config
-                .specs
-                .iter()
-                .map(|s| s.prefix.as_str())
-                .collect();
-            if known_prefixes.is_empty() {
-                return diagnostics;
-            }
-
-            let mut known_rules_by_prefix: std::collections::HashMap<&str, Vec<RuleId>> =
-                std::collections::HashMap::new();
-            let mut rules_by_id: std::collections::HashMap<RuleId, ApiRule> =
-                std::collections::HashMap::new();
-            for spec_cfg in &data.config.specs {
-                let rule_ids = known_rules_by_prefix
-                    .entry(spec_cfg.prefix.as_str())
-                    .or_default();
-                for ((spec_name, _), forward_data) in &data.forward_by_impl {
-                    if spec_name == &spec_cfg.name {
-                        for rule in &forward_data.rules {
-                            rule_ids.push(rule.id.clone());
-                            rules_by_id
-                                .entry(rule.id.clone())
-                                .or_insert_with(|| rule.clone());
-                        }
-                    }
-                }
-            }
-
-            for reference in extract_markdown_rule_references(&req.content) {
-                let (start_line, start_char, end_line, end_char) =
-                    span_to_range(&req.content, reference.span_offset, reference.span_length);
-
-                if !known_prefixes.contains(reference.prefix.as_str()) {
-                    diagnostics.push(LspDiagnostic {
-                        severity: "error".to_string(),
-                        code: "unknown-prefix".to_string(),
-                        message: format!("Unknown prefix: '{}'", reference.prefix),
-                        start_line,
-                        start_char,
-                        end_line,
-                        end_char,
-                    });
-                    continue;
-                }
-
-                let known_for_prefix = known_rules_by_prefix
-                    .get(reference.prefix.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                match classify_reference_against_known_rules(&reference.req_id, known_for_prefix) {
-                    KnownRuleMatch::Exact => {}
-                    KnownRuleMatch::Stale(current_rule_id) => {
-                        let message = stale_diagnostic_message_short(
-                            &reference.req_id,
-                            rules_by_id.get(&current_rule_id),
-                        );
-                        diagnostics.push(LspDiagnostic {
-                            severity: "warning".to_string(),
-                            code: "stale".to_string(),
-                            message,
-                            start_line,
-                            start_char,
-                            end_line,
-                            end_char,
-                        });
-                    }
-                    KnownRuleMatch::Missing => {
-                        let message = unknown_rule_message_with_suggestions(
-                            &reference.req_id,
-                            known_for_prefix,
-                        );
-                        diagnostics.push(LspDiagnostic {
-                            severity: "warning".to_string(),
-                            code: "orphaned".to_string(),
-                            message,
-                            start_line,
-                            start_char,
-                            end_line,
-                            end_char,
-                        });
-                    }
-                }
-            }
-
-            return diagnostics;
-        }
-
-        // For source files, use precomputed build diagnostics (single source of truth).
-        let project_root = self.inner.engine.project_root();
-        let canonical_root = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.to_path_buf());
-        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-        let relative_path = if canonical_path.is_absolute() {
-            canonical_path
-                .strip_prefix(&canonical_root)
-                .ok()
-                .map(|p| p.to_string_lossy())
-        } else {
-            Some(canonical_path.to_string_lossy())
-        };
-        let normalized = relative_path.map(|p| p.replace('\\', "/"));
-        if let Some(precomputed) = data
-            .workspace_diagnostics
-            .iter()
-            .find(|entry| normalized.as_deref() == Some(entry.path.as_str()))
-        {
-            return precomputed.diagnostics.clone();
-        }
-
-        // Live fallback for VFS-only files that are not part of the precomputed workspace set yet.
-        let reqs = lookup_source_reqs(&data, &path)
-            .cloned()
-            .unwrap_or_else(|| tracey_core::Reqs::extract_from_content(&path, &req.content));
-        let is_test = {
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            data.test_files.contains(&path) || data.test_files.contains(&canonical)
-        };
-        crate::data::compute_source_file_diagnostics(
-            &req.content,
-            &reqs,
-            is_test,
-            &data.config,
-            &data.forward_by_impl,
-        )
-    }
-
-    /// Get diagnostics for all files in the workspace
-    async fn lsp_workspace_diagnostics(&self, _cx: &Context) -> Vec<LspFileDiagnostics> {
+    async fn lsp_workspace_diagnostics(&self) -> Vec<LspFileDiagnostics> {
         let data = self.inner.engine.data().await;
         data.workspace_diagnostics.clone()
     }
@@ -1379,7 +1173,7 @@ impl TraceyDaemon for TraceyService {
     ///
     /// r[impl lsp.symbols.references]
     /// r[impl lsp.symbols.requirements]
-    async fn lsp_document_symbols(&self, _cx: &Context, req: LspDocumentRequest) -> Vec<LspSymbol> {
+    async fn lsp_document_symbols(&self, req: LspDocumentRequest) -> Vec<LspSymbol> {
         let path = PathBuf::from(&req.path);
         let mut symbols = Vec::new();
 
@@ -1441,7 +1235,7 @@ impl TraceyDaemon for TraceyService {
     /// Search workspace for requirement IDs
     ///
     /// r[impl lsp.workspace-symbols.requirements]
-    async fn lsp_workspace_symbols(&self, _cx: &Context, query: String) -> Vec<LspSymbol> {
+    async fn lsp_workspace_symbols(&self, query: String) -> Vec<LspSymbol> {
         let data = self.inner.engine.data().await;
         let query_lower = query.to_lowercase();
 
@@ -1478,11 +1272,7 @@ impl TraceyDaemon for TraceyService {
     ///
     /// r[impl lsp.semantic-tokens.prefix]
     /// r[impl lsp.semantic-tokens.verb]
-    async fn lsp_semantic_tokens(
-        &self,
-        _cx: &Context,
-        req: LspDocumentRequest,
-    ) -> Vec<LspSemanticToken> {
+    async fn lsp_semantic_tokens(&self, req: LspDocumentRequest) -> Vec<LspSemanticToken> {
         let path = PathBuf::from(&req.path);
         let data = self.inner.engine.data().await;
 
@@ -1549,7 +1339,7 @@ impl TraceyDaemon for TraceyService {
     /// r[impl lsp.codelens.coverage]
     /// r[impl lsp.codelens.clickable]
     /// r[impl lsp.codelens.run-test]
-    async fn lsp_code_lens(&self, _cx: &Context, req: LspDocumentRequest) -> Vec<LspCodeLens> {
+    async fn lsp_code_lens(&self, req: LspDocumentRequest) -> Vec<LspCodeLens> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -1633,7 +1423,7 @@ impl TraceyDaemon for TraceyService {
     ///
     /// r[impl lsp.inlay.coverage-status]
     /// r[impl lsp.inlay.impl-count]
-    async fn lsp_inlay_hints(&self, _cx: &Context, req: InlayHintsRequest) -> Vec<LspInlayHint> {
+    async fn lsp_inlay_hints(&self, req: InlayHintsRequest) -> Vec<LspInlayHint> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -1713,11 +1503,7 @@ impl TraceyDaemon for TraceyService {
     /// Prepare rename (check if renaming is valid)
     ///
     /// r[impl lsp.rename.prepare]
-    async fn lsp_prepare_rename(
-        &self,
-        _cx: &Context,
-        req: LspPositionRequest,
-    ) -> Option<PrepareRenameResult> {
+    async fn lsp_prepare_rename(&self, req: LspPositionRequest) -> Option<PrepareRenameResult> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -1749,7 +1535,7 @@ impl TraceyDaemon for TraceyService {
     ///
     /// r[impl lsp.rename.req-id]
     /// r[impl lsp.rename.validation]
-    async fn lsp_rename(&self, _cx: &Context, req: LspRenameRequest) -> Vec<LspTextEdit> {
+    async fn lsp_rename(&self, req: LspRenameRequest) -> Vec<LspTextEdit> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -1810,7 +1596,7 @@ impl TraceyDaemon for TraceyService {
     ///
     /// r[impl lsp.actions.create-requirement]
     /// r[impl lsp.actions.open-dashboard]
-    async fn lsp_code_actions(&self, _cx: &Context, req: LspPositionRequest) -> Vec<LspCodeAction> {
+    async fn lsp_code_actions(&self, req: LspPositionRequest) -> Vec<LspCodeAction> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -1880,11 +1666,7 @@ impl TraceyDaemon for TraceyService {
     ///
     /// r[impl lsp.highlight.full-range]
     /// r[impl lsp.highlight.consistent]
-    async fn lsp_document_highlight(
-        &self,
-        _cx: &Context,
-        req: LspPositionRequest,
-    ) -> Vec<LspLocation> {
+    async fn lsp_document_highlight(&self, req: LspPositionRequest) -> Vec<LspLocation> {
         let data = self.inner.engine.data().await;
         let path = PathBuf::from(&req.path);
 
@@ -1946,11 +1728,7 @@ impl TraceyDaemon for TraceyService {
     ///
     /// r[impl mcp.config.exclude]
     /// r[impl mcp.config.persist]
-    async fn config_add_exclude(
-        &self,
-        _cx: &Context,
-        req: ConfigPatternRequest,
-    ) -> Result<(), String> {
+    async fn config_add_exclude(&self, req: ConfigPatternRequest) -> Result<(), String> {
         let data = self.inner.engine.data().await;
         let (spec_name, impl_name) =
             self.resolve_spec_impl(req.spec.as_deref(), req.impl_name.as_deref(), &data.config);
@@ -1993,11 +1771,7 @@ impl TraceyDaemon for TraceyService {
     ///
     /// r[impl mcp.config.include]
     /// r[impl mcp.config.persist]
-    async fn config_add_include(
-        &self,
-        _cx: &Context,
-        req: ConfigPatternRequest,
-    ) -> Result<(), String> {
+    async fn config_add_include(&self, req: ConfigPatternRequest) -> Result<(), String> {
         let data = self.inner.engine.data().await;
         let (spec_name, impl_name) =
             self.resolve_spec_impl(req.spec.as_deref(), req.impl_name.as_deref(), &data.config);
@@ -2053,134 +1827,6 @@ struct RuleAtPosition {
     span_length: usize,
 }
 
-struct MarkdownRuleReference {
-    prefix: String,
-    req_id: RuleId,
-    span_offset: usize,
-    span_length: usize,
-}
-
-fn parse_markdown_fence(line: &[u8], mut i: usize) -> Option<(u8, usize)> {
-    while i < line.len() && matches!(line[i], b' ' | b'\t') {
-        i += 1;
-    }
-    let fence_char = *line.get(i)?;
-    if fence_char != b'`' && fence_char != b'~' {
-        return None;
-    }
-    let mut count = 0usize;
-    while i + count < line.len() && line[i + count] == fence_char {
-        count += 1;
-    }
-    (count >= 3).then_some((fence_char, count))
-}
-
-fn markdown_fenced_code_mask(content: &str) -> Vec<bool> {
-    let mut mask = vec![false; content.len()];
-    let mut line_start = 0usize;
-    let mut in_fence: Option<(u8, usize)> = None;
-
-    for line in content.split_inclusive('\n') {
-        let line_end = line_start + line.len();
-        let fence = parse_markdown_fence(line.as_bytes(), 0);
-
-        if let Some((fence_char, fence_len)) = fence {
-            match in_fence {
-                Some((open_char, open_len)) if fence_char == open_char && fence_len >= open_len => {
-                    mask[line_start..line_end].fill(true);
-                    in_fence = None;
-                    line_start = line_end;
-                    continue;
-                }
-                None => {
-                    in_fence = Some((fence_char, fence_len));
-                    mask[line_start..line_end].fill(true);
-                    line_start = line_end;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-
-        if in_fence.is_some() {
-            mask[line_start..line_end].fill(true);
-        }
-
-        line_start = line_end;
-    }
-
-    mask
-}
-
-fn extract_markdown_rule_references(content: &str) -> Vec<MarkdownRuleReference> {
-    let bytes = content.as_bytes();
-    let mut out = Vec::new();
-    let fenced_code_mask = markdown_fenced_code_mask(content);
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        if fenced_code_mask.get(i).copied().unwrap_or(false) {
-            i += 1;
-            continue;
-        }
-
-        let c = bytes[i];
-        if !c.is_ascii_lowercase() && !c.is_ascii_digit() {
-            i += 1;
-            continue;
-        }
-
-        let start = i;
-        let mut prefix_end = i + 1;
-        while prefix_end < bytes.len()
-            && (bytes[prefix_end].is_ascii_lowercase() || bytes[prefix_end].is_ascii_digit())
-        {
-            prefix_end += 1;
-        }
-        if prefix_end >= bytes.len() || bytes[prefix_end] != b'[' {
-            i += 1;
-            continue;
-        }
-
-        let req_start = prefix_end + 1;
-        let mut req_end = req_start;
-        while req_end < bytes.len()
-            && (bytes[req_end].is_ascii_lowercase()
-                || bytes[req_end].is_ascii_digit()
-                || matches!(bytes[req_end], b'.' | b'-' | b'+'))
-        {
-            req_end += 1;
-        }
-        if req_end >= bytes.len() || bytes[req_end] != b']' || req_end == req_start {
-            i += 1;
-            continue;
-        }
-
-        let Some(prefix) = content.get(start..prefix_end) else {
-            i += 1;
-            continue;
-        };
-        let Some(req_text) = content.get(req_start..req_end) else {
-            i += 1;
-            continue;
-        };
-        let Some(req_id) = parse_rule_id(req_text) else {
-            i += 1;
-            continue;
-        };
-
-        out.push(MarkdownRuleReference {
-            prefix: prefix.to_string(),
-            req_id,
-            span_offset: start,
-            span_length: req_end - start + 1,
-        });
-        i = req_end + 1;
-    }
-
-    out
-}
-
 /// Look up build-data reqs for a source file path.
 /// Returns `None` if the file was not part of the build scan.
 fn lookup_source_reqs<'a>(
@@ -2227,22 +1873,21 @@ async fn find_rule_at_position(
             return Some(rule);
         }
 
-        extract_markdown_rule_references(content)
-            .into_iter()
-            .find_map(|r| {
-                let start = r.span_offset;
-                let end = r.span_offset + r.span_length;
-                if target_offset >= start && target_offset < end {
-                    Some(RuleAtPosition {
-                        req_id: r.req_id,
-                        prefix: Some(r.prefix),
-                        span_offset: r.span_offset,
-                        span_length: r.span_length,
-                    })
-                } else {
-                    None
-                }
-            })
+        doc.inline_code_spans.iter().find_map(|code_span| {
+            let (prefix, req_id) = crate::data::parse_inline_rule_reference(&code_span.content)?;
+            let start = code_span.span.offset;
+            let end = code_span.span.offset + code_span.span.length;
+            if target_offset >= start && target_offset < end {
+                Some(RuleAtPosition {
+                    req_id,
+                    prefix: Some(prefix),
+                    span_offset: code_span.span.offset,
+                    span_length: code_span.span.length,
+                })
+            } else {
+                None
+            }
+        })
     } else {
         let reqs = lookup_source_reqs(data, path)?;
         let ref_at_pos = find_ref_at_position(reqs, content, line, character)?;
@@ -2339,58 +1984,6 @@ fn span_to_range(content: &str, offset: usize, length: usize) -> (u32, u32, u32,
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum KnownRuleMatch {
-    Exact,
-    Stale(RuleId),
-    Missing,
-}
-
-// r[impl coverage.compute.stale]
-// r[impl coverage.compute.stale.update]
-fn classify_reference_against_known_rules(
-    reference_id: &RuleId,
-    known_rule_ids: &[RuleId],
-) -> KnownRuleMatch {
-    let mut stale_target: Option<RuleId> = None;
-
-    for rule_id in known_rule_ids {
-        match classify_reference_for_rule(rule_id, reference_id) {
-            RuleIdMatch::Exact => return KnownRuleMatch::Exact,
-            RuleIdMatch::Stale => {
-                stale_target = Some(rule_id.clone());
-            }
-            RuleIdMatch::NoMatch => {}
-        }
-    }
-
-    if let Some(rule_id) = stale_target {
-        KnownRuleMatch::Stale(rule_id)
-    } else {
-        KnownRuleMatch::Missing
-    }
-}
-
-fn unknown_rule_message_with_suggestions(
-    reference_id: &RuleId,
-    known_rule_ids: &[RuleId],
-) -> String {
-    let suggestions = suggest_similar_rule_ids(reference_id, known_rule_ids, 3);
-    if suggestions.is_empty() {
-        format!("Reference to unknown rule '{}'", reference_id)
-    } else {
-        format!(
-            "Reference to unknown rule '{}' (did you mean: {})",
-            reference_id,
-            suggestions
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
 /// Find a rule by ID in the engine data
 fn find_rule_in_data<'a>(
     data: &'a crate::data::DashboardData,
@@ -2455,23 +2048,6 @@ async fn load_previous_rule_text_from_git(
     }
 
     None
-}
-
-/// Short stale diagnostic for LSP — just the prefix and reference info, no diff.
-fn stale_diagnostic_message_short(
-    reference_rule_id: &RuleId,
-    current_rule: Option<&ApiRule>,
-) -> String {
-    let mut message = String::from(STALE_IMPLEMENTATION_MUST_CHANGE_PREFIX);
-    if let Some(current_rule) = current_rule {
-        message.push_str(&format!(
-            ". Reference '{}' is stale; current rule is '{}'.",
-            reference_rule_id, current_rule.id
-        ));
-    } else {
-        message.push_str(". The referenced annotation is stale, but the latest matching rule could not be loaded.");
-    }
-    message
 }
 
 /// Save config to file

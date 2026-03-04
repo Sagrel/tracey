@@ -12,7 +12,7 @@ use tracey_proto::*;
 // Re-export test modules
 mod common;
 
-fn rpc<T, E: std::fmt::Debug>(res: Result<T, roam_stream::CallError<E>>) -> T {
+fn rpc<T, E: std::fmt::Debug>(res: Result<T, roam::RoamError<E>>) -> T {
     res.expect("RPC call failed")
 }
 
@@ -542,20 +542,71 @@ async fn test_lsp_definition_on_markdown_backtick_reference() {
 }
 
 #[tokio::test]
+async fn test_workspace_diagnostics_include_spec_coverage_hints() {
+    let service = create_test_service().await;
+
+    let all_diags = rpc(service.client.lsp_workspace_diagnostics().await);
+    let spec_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("spec.md"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
+
+    // data.format and error.logging have no implementations -> "uncovered" hints
+    let uncovered: Vec<_> = spec_diags
+        .iter()
+        .filter(|d| d.code == "uncovered")
+        .collect();
+    assert!(
+        uncovered.len() >= 2,
+        "Expected at least 2 uncovered hints (data.format, error.logging), got {}: {uncovered:?}",
+        uncovered.len()
+    );
+
+    // auth.session and auth.logout have impl but no verify -> "untested" hints
+    let untested: Vec<_> = spec_diags.iter().filter(|d| d.code == "untested").collect();
+    assert!(
+        untested.len() >= 2,
+        "Expected at least 2 untested hints (auth.session, auth.logout), got {}: {untested:?}",
+        untested.len()
+    );
+
+    // All coverage hints should be severity "hint"
+    for d in &spec_diags {
+        if d.code == "uncovered" || d.code == "untested" {
+            assert_eq!(
+                d.severity, "hint",
+                "Coverage diagnostic should be severity 'hint'"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_lsp_diagnostics_orphaned_markdown_backtick_reference() {
     let service = create_test_service().await;
 
-    let content = "See `r[auth.typo]` for details.";
-    let req = LspDocumentRequest {
-        path: fixtures_dir().join("spec.md").display().to_string(),
-        content: content.to_string(),
-    };
+    let spec_path = fixtures_dir().join("spec.md");
+    let original = std::fs::read_to_string(&spec_path).unwrap();
+    let content = format!("{original}\nSee `r[auth.typo]` for details.\n");
 
-    let diagnostics = rpc(service.client.lsp_diagnostics(req).await);
-    let orphaned = diagnostics.iter().find(|d| d.code == "orphaned");
+    // Feed modified content through VFS overlay and rebuild
+    rpc(service
+        .client
+        .vfs_open(spec_path.display().to_string(), content.to_string())
+        .await);
+    rpc(service.client.reload().await);
+
+    let all_diags = rpc(service.client.lsp_workspace_diagnostics().await);
+    let spec_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("spec.md"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
+    let orphaned = spec_diags.iter().find(|d| d.code == "orphaned");
     assert!(
         orphaned.is_some(),
-        "Expected orphaned diagnostic for markdown backtick reference"
+        "Expected orphaned diagnostic for markdown backtick reference, got: {spec_diags:?}"
     );
 }
 
@@ -583,11 +634,14 @@ specs (
 "#,
     )
     .expect("Failed to write config");
+    // Spec has auth.login+2 definition AND a stale r[auth.login] backtick reference
     std::fs::write(
         project_root.join("spec.md"),
         r#"
 r[auth.login+2]
 Users MUST provide valid credentials to log in.
+
+See `r[auth.login]` for details.
 "#,
     )
     .expect("Failed to write spec");
@@ -602,17 +656,16 @@ Users MUST provide valid credentials to log in.
     let service = tracey::daemon::TraceyService::new(engine);
     let rpc_service = common::create_test_rpc_service(service).await;
 
-    let content = "See `r[auth.login]` for details.";
-    let req = LspDocumentRequest {
-        path: project_root.join("spec.md").display().to_string(),
-        content: content.to_string(),
-    };
-
-    let diagnostics = rpc(rpc_service.client.lsp_diagnostics(req).await);
-    let stale = diagnostics.iter().find(|d| d.code == "stale");
+    let all_diags = rpc(rpc_service.client.lsp_workspace_diagnostics().await);
+    let spec_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("spec.md"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
+    let stale = spec_diags.iter().find(|d| d.code == "stale");
     assert!(
         stale.is_some(),
-        "Expected stale diagnostic for markdown backtick reference"
+        "Expected stale diagnostic for markdown backtick reference, got: {spec_diags:?}"
     );
 }
 
@@ -649,19 +702,16 @@ async fn test_lsp_completions() {
 #[tokio::test]
 async fn test_lsp_diagnostics_orphaned_reference() {
     let service = create_test_service_named("orphaned").await;
-    let dir = fixtures_named("orphaned");
 
-    let content = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
-
-    let req = LspDocumentRequest {
-        path: dir.join("src/lib.rs").display().to_string(),
-        content: content.to_string(),
-    };
-
-    let diagnostics = rpc(service.client.lsp_diagnostics(req).await);
+    let all_diags = rpc(service.client.lsp_workspace_diagnostics().await);
+    let src_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("src/lib.rs"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
 
     // Should have a diagnostic for the orphaned reference
-    let orphaned = diagnostics.iter().find(|d| d.code == "orphaned");
+    let orphaned = src_diags.iter().find(|d| d.code == "orphaned");
     assert!(orphaned.is_some(), "Expected orphaned diagnostic");
 }
 
@@ -1019,19 +1069,16 @@ async fn test_validate_other_spec_ignores_r_prefix() {
 #[tokio::test]
 async fn test_validate_detects_unknown_rule_in_matching_prefix() {
     let service = create_test_service_named("orphaned").await;
-    let dir = fixtures_named("orphaned");
 
-    let content = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
-
-    let req = LspDocumentRequest {
-        path: dir.join("src/lib.rs").display().to_string(),
-        content: content.to_string(),
-    };
-
-    let diagnostics = rpc(service.client.lsp_diagnostics(req).await);
+    let all_diags = rpc(service.client.lsp_workspace_diagnostics().await);
+    let src_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("src/lib.rs"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
 
     // Should have a diagnostic for the orphaned reference
-    let orphaned = diagnostics.iter().find(|d| d.code == "orphaned");
+    let orphaned = src_diags.iter().find(|d| d.code == "orphaned");
     assert!(
         orphaned.is_some(),
         "Expected orphaned diagnostic for r[impl nonexistent.rule]"
@@ -1148,16 +1195,14 @@ pub fn beta_impl() {}
         beta_result.errors
     );
 
-    let content = std::fs::read_to_string(root.join("src/lib.rs")).expect("Failed to read source");
-    let diagnostics = rpc(rpc_service
-        .client
-        .lsp_diagnostics(LspDocumentRequest {
-            path: root.join("src/lib.rs").display().to_string(),
-            content,
-        })
-        .await);
+    let all_diags = rpc(rpc_service.client.lsp_workspace_diagnostics().await);
+    let src_diags: Vec<_> = all_diags
+        .iter()
+        .filter(|d| d.path.ends_with("src/lib.rs"))
+        .flat_map(|d| &d.diagnostics)
+        .collect();
 
-    let unknown_prefix_errors: Vec<_> = diagnostics
+    let unknown_prefix_errors: Vec<_> = src_diags
         .iter()
         .filter(|d| d.code == "unknown-prefix")
         .collect();

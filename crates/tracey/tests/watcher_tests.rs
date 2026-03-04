@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tracey::daemon::watcher::{WatcherState, glob_to_watch_dir};
 
-fn rpc<T, E: std::fmt::Debug>(res: Result<T, roam_stream::CallError<E>>) -> T {
+fn rpc<T, E: std::fmt::Debug>(res: Result<T, roam::RoamError<E>>) -> T {
     res.expect("RPC call failed")
 }
 
@@ -457,7 +457,7 @@ async fn test_rebuild_add_new_source_file() {
         .expect("write new source file");
 
     engine
-        .rebuild_with_changes(&[new_file.clone()])
+        .rebuild_with_changes(std::slice::from_ref(&new_file))
         .await
         .expect("rebuild failed");
 

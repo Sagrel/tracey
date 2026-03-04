@@ -23,7 +23,7 @@ use tracey_core::{RefVerb, parse_rule_id};
 use tracey_proto::*;
 
 /// Convert roam RPC result to a simple Result
-fn rpc<T, E: std::fmt::Debug>(res: Result<T, roam_stream::CallError<E>>) -> Result<T, String> {
+fn rpc<T, E: std::fmt::Debug>(res: Result<T, roam::RoamError<E>>) -> Result<T, String> {
     res.map_err(|e| format!("RPC error: {:?}", e))
 }
 
@@ -479,12 +479,17 @@ impl Backend {
         else {
             return;
         };
-        self.spawn_watcher_if_needed(project_root, daemon_client.clone(), should_watch);
         if let Ok(path) = uri.to_file_path() {
-            let _ = daemon_client
-                .vfs_open(path.to_string_lossy().into_owned(), content.to_string())
-                .await;
+            let path = path.to_string_lossy().into_owned();
+            let content = content.to_string();
+            let bg_client = daemon_client.clone();
+            let bg_path = path.clone();
+            let bg_content = content.clone();
+            tokio::spawn(async move {
+                let _ = bg_client.vfs_open(bg_path, bg_content).await;
+            });
         }
+        self.spawn_watcher_if_needed(project_root, daemon_client, should_watch);
     }
 
     /// Notify daemon that a file changed.
@@ -493,12 +498,17 @@ impl Backend {
         else {
             return;
         };
-        self.spawn_watcher_if_needed(project_root, daemon_client.clone(), should_watch);
         if let Ok(path) = uri.to_file_path() {
-            let _ = daemon_client
-                .vfs_change(path.to_string_lossy().into_owned(), content.to_string())
-                .await;
+            let path = path.to_string_lossy().into_owned();
+            let content = content.to_string();
+            let bg_client = daemon_client.clone();
+            let bg_path = path.clone();
+            let bg_content = content.clone();
+            tokio::spawn(async move {
+                let _ = bg_client.vfs_change(bg_path, bg_content).await;
+            });
         }
+        self.spawn_watcher_if_needed(project_root, daemon_client, should_watch);
     }
 
     /// Notify daemon that a file was closed.
@@ -507,12 +517,15 @@ impl Backend {
         else {
             return;
         };
-        self.spawn_watcher_if_needed(project_root, daemon_client.clone(), should_watch);
         if let Ok(path) = uri.to_file_path() {
-            let _ = daemon_client
-                .vfs_close(path.to_string_lossy().into_owned())
-                .await;
+            let path = path.to_string_lossy().into_owned();
+            let bg_client = daemon_client.clone();
+            let bg_path = path.clone();
+            tokio::spawn(async move {
+                let _ = bg_client.vfs_close(bg_path).await;
+            });
         }
+        self.spawn_watcher_if_needed(project_root, daemon_client, should_watch);
     }
 
     fn is_project_config_uri(uri: &Url, project_root: &Path) -> bool {
@@ -651,6 +664,9 @@ impl Backend {
         project_state: Arc<Mutex<LspProjectState>>,
     ) {
         let mut last_version: Option<u64> = None;
+        let (tx, mut rx) = roam::channel::<DataUpdate>();
+        let subscribe_client = daemon_client.clone();
+        let subscribe_task = tokio::spawn(async move { subscribe_client.subscribe(tx).await });
 
         loop {
             {
@@ -659,36 +675,34 @@ impl Backend {
                     break;
                 }
             }
+            let next_version =
+                match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                    Ok(Ok(Some(update))) => Some(update.version),
+                    Ok(Ok(None)) => daemon_client.version().await.ok(),
+                    Ok(Err(_)) => daemon_client.version().await.ok(),
+                    Err(_) => daemon_client.version().await.ok(),
+                };
 
-            let (tx, mut rx) = roam::channel::<DataUpdate>();
-            let subscribe_client = daemon_client.clone();
-            let subscribe_task = tokio::spawn(async move { subscribe_client.subscribe(tx).await });
+            let Some(next_version) = next_version else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            };
 
-            while let Ok(Some(update)) = rx.recv().await {
-                {
-                    let state = project_state.lock().unwrap();
-                    if !state.roots.contains(&project_root) {
-                        subscribe_task.abort();
-                        return;
-                    }
-                }
-                if last_version == Some(update.version) {
-                    continue;
-                }
-                last_version = Some(update.version);
-                Self::publish_workspace_diagnostics_with(
-                    &client,
-                    &daemon_client,
-                    &project_root,
-                    &project_state,
-                )
-                .await;
+            if last_version == Some(next_version) {
+                continue;
             }
-
-            subscribe_task.abort();
-            let _ = subscribe_task.await;
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            last_version = Some(next_version);
+            Self::publish_workspace_diagnostics_with(
+                &client,
+                &daemon_client,
+                &project_root,
+                &project_state,
+            )
+            .await;
         }
+
+        subscribe_task.abort();
+        let _ = subscribe_task.await;
     }
 
     /// Clear diagnostics for workspace files on startup so clients don't retain stale diagnostics
@@ -733,16 +747,9 @@ impl Backend {
 
     async fn add_workspace_root(&self, root_hint: PathBuf) {
         let (project_root, daemon_client, should_watch, _) = self.ensure_project_root(root_hint);
-        self.spawn_watcher_if_needed(project_root.clone(), daemon_client.clone(), should_watch);
         self.clear_workspace_diagnostics_on_startup(&project_root)
             .await;
-        Self::publish_workspace_diagnostics_with(
-            &self.client,
-            &daemon_client,
-            &project_root,
-            &self.project_state,
-        )
-        .await;
+        self.spawn_watcher_if_needed(project_root, daemon_client, should_watch);
     }
 
     async fn remove_workspace_root(&self, root_hint: PathBuf) {

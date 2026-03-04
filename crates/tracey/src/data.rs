@@ -1075,7 +1075,7 @@ async fn load_rules_from_includes_cached(
     quiet: bool,
     changed_files: &[PathBuf],
     stats: &mut CacheStats,
-) -> Result<(Vec<crate::ExtractedRule>, bool)> {
+) -> Result<(Vec<crate::ExtractedRule>, Vec<PathBuf>, bool)> {
     let (mut spec_paths, _warnings, did_full_walk) =
         get_cached_spec_scan_paths(project_root, include_patterns, changed_files, cache);
     let (spec_roots, _) = build_scan_roots(project_root, include_patterns);
@@ -1090,10 +1090,10 @@ async fn load_rules_from_includes_cached(
 
     let mut all_rules = Vec::new();
     let mut seen_ids: BTreeSet<String> = BTreeSet::new();
-    for path in spec_paths {
+    let collected_paths: Vec<PathBuf> = spec_paths.into_iter().collect();
+    for path in &collected_paths {
         let extracted =
-            extract_markdown_rules_cached(project_root, &path, overlay, cache, quiet, stats)
-                .await?;
+            extract_markdown_rules_cached(project_root, path, overlay, cache, quiet, stats).await?;
         for rule in extracted {
             let id = rule.def.id.to_string();
             if seen_ids.contains(&id) {
@@ -1107,7 +1107,7 @@ async fn load_rules_from_includes_cached(
             all_rules.push(rule);
         }
     }
-    Ok((all_rules, did_full_walk))
+    Ok((all_rules, collected_paths, did_full_walk))
 }
 
 async fn scan_impl_files(
@@ -1598,6 +1598,7 @@ fn source_issue_to_lsp(issue: SourceDiagnosticIssue) -> LspDiagnostic {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_validation_by_impl(
     abs_root: &Path,
     config_path: &Path,
@@ -1829,31 +1830,21 @@ fn source_reference_uses_explicit_verb(
     inner.contains(' ')
 }
 
-pub(crate) fn compute_source_file_diagnostics(
-    content: &str,
-    reqs: &Reqs,
-    is_test: bool,
-    config: &ApiConfig,
-    forward_by_impl: &BTreeMap<ImplKey, ApiSpecForward>,
-) -> Vec<LspDiagnostic> {
-    let ctx = build_source_diagnostic_context(config, forward_by_impl);
-    collect_source_diagnostic_issues(content, reqs, is_test, &ctx)
-        .into_iter()
-        .map(source_issue_to_lsp)
-        .collect()
-}
-
-fn compute_workspace_diagnostics(
+#[allow(clippy::too_many_arguments)]
+async fn compute_workspace_diagnostics(
     abs_root: &Path,
     config_path: &Path,
     config: &ApiConfig,
     forward_by_impl: &BTreeMap<ImplKey, ApiSpecForward>,
     source_reqs_by_file: &BTreeMap<PathBuf, Reqs>,
     file_contents: &BTreeMap<PathBuf, String>,
+    spec_file_contents: &BTreeMap<PathBuf, String>,
     test_files: &std::collections::HashSet<PathBuf>,
     include_parse_failures: &BTreeMap<PathBuf, String>,
 ) -> Vec<LspFileDiagnostics> {
     let mut out = Vec::new();
+
+    // Source file diagnostics
     let source_ctx = build_source_diagnostic_context(config, forward_by_impl);
     for (path, reqs) in source_reqs_by_file {
         let Some(content) = file_contents.get(path) else {
@@ -1878,6 +1869,11 @@ fn compute_workspace_diagnostics(
             diagnostics,
         });
     }
+
+    // Spec file diagnostics (coverage hints + cross-reference validation)
+    out.extend(
+        compute_spec_file_diagnostics(abs_root, config, forward_by_impl, spec_file_contents).await,
+    );
 
     if !include_parse_failures.is_empty() {
         let config_rel_path = config_path
@@ -1918,6 +1914,226 @@ fn compute_workspace_diagnostics(
     }
 
     out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// Parse an inline code span content like `r[auth.login]` into (prefix, rule_id).
+/// Returns None if the content doesn't match the `PREFIX[RULE_ID]` pattern.
+pub(crate) fn parse_inline_rule_reference(content: &str) -> Option<(String, RuleId)> {
+    let bytes = content.as_bytes();
+    let bracket = bytes.iter().position(|&b| b == b'[')?;
+    if bracket == 0 {
+        return None;
+    }
+    let prefix = &content[..bracket];
+    if !prefix
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return None;
+    }
+    let rest = &content[bracket + 1..];
+    let close = rest.find(']')?;
+    if close + bracket + 2 != content.len() {
+        return None; // extra chars after ]
+    }
+    let rule_str = &rest[..close];
+    let rule_id = parse_rule_id(rule_str)?;
+    Some((prefix.to_string(), rule_id))
+}
+
+/// Compute diagnostics for spec markdown files: coverage hints + cross-reference validation.
+async fn compute_spec_file_diagnostics(
+    abs_root: &Path,
+    config: &ApiConfig,
+    forward_by_impl: &BTreeMap<ImplKey, ApiSpecForward>,
+    spec_file_contents: &BTreeMap<PathBuf, String>,
+) -> Vec<LspFileDiagnostics> {
+    let mut out = Vec::new();
+
+    // Build lookup structures
+    let known_prefixes: std::collections::HashSet<&str> =
+        config.specs.iter().map(|s| s.prefix.as_str()).collect();
+    if known_prefixes.is_empty() {
+        return out;
+    }
+
+    let mut known_rules_by_prefix: HashMap<&str, Vec<RuleId>> = HashMap::new();
+    let mut rules_by_id: HashMap<RuleId, &ApiRule> = HashMap::new();
+    for spec_cfg in &config.specs {
+        let rule_ids = known_rules_by_prefix
+            .entry(spec_cfg.prefix.as_str())
+            .or_default();
+        for ((spec_name, _), forward_data) in forward_by_impl {
+            if spec_name == &spec_cfg.name {
+                for rule in &forward_data.rules {
+                    rule_ids.push(rule.id.clone());
+                    rules_by_id.entry(rule.id.clone()).or_insert(rule);
+                }
+            }
+        }
+    }
+
+    for (path, content) in spec_file_contents {
+        let mut diagnostics = Vec::new();
+
+        // Coverage diagnostics: parse the markdown to get requirement definitions
+        let options = RenderOptions::default();
+        if let Ok(doc) = render(content, &options).await {
+            for def in &doc.reqs {
+                let (start_line, start_char, end_line, end_char) =
+                    span_to_range(content, def.marker_span.offset, def.marker_span.length);
+
+                if let Some(rule_id) = parse_rule_id(&def.id.to_string()) {
+                    // Find the rule across all impls to check coverage
+                    let mut best_rule: Option<&ApiRule> = None;
+                    for ((_, _), forward_data) in forward_by_impl {
+                        for rule in &forward_data.rules {
+                            if rule.id.base == rule_id.base {
+                                match best_rule {
+                                    Some(current) if current.id.version >= rule.id.version => {}
+                                    _ => best_rule = Some(rule),
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(rule) = best_rule {
+                        let impl_count = rule.impl_refs.len();
+                        let verify_count = rule.verify_refs.len();
+
+                        if impl_count == 0 {
+                            diagnostics.push(LspDiagnostic {
+                                severity: "hint".to_string(),
+                                code: "uncovered".to_string(),
+                                message: "Requirement has no implementations".to_string(),
+                                start_line,
+                                start_char,
+                                end_line,
+                                end_char,
+                            });
+                        } else if verify_count == 0 {
+                            diagnostics.push(LspDiagnostic {
+                                severity: "hint".to_string(),
+                                code: "untested".to_string(),
+                                message: format!(
+                                    "Requirement has {impl_count} impl but no verification"
+                                ),
+                                start_line,
+                                start_char,
+                                end_line,
+                                end_char,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Cross-reference validation: only backtick inline code spans like `r[auth.login]`
+            for code_span in &doc.inline_code_spans {
+                let Some((prefix, req_id)) = parse_inline_rule_reference(&code_span.content) else {
+                    continue;
+                };
+                let (start_line, start_char, end_line, end_char) =
+                    span_to_range(content, code_span.span.offset, code_span.span.length);
+
+                if !known_prefixes.contains(prefix.as_str()) {
+                    diagnostics.push(LspDiagnostic {
+                        severity: "error".to_string(),
+                        code: "unknown-prefix".to_string(),
+                        message: format!("Unknown prefix: '{prefix}'"),
+                        start_line,
+                        start_char,
+                        end_line,
+                        end_char,
+                    });
+                    continue;
+                }
+
+                let known_for_prefix = known_rules_by_prefix
+                    .get(prefix.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+
+                // Classify reference against known rules
+                let mut stale_target: Option<RuleId> = None;
+                let mut exact = false;
+                for rule_id in known_for_prefix {
+                    match classify_reference_for_rule(rule_id, &req_id) {
+                        RuleIdMatch::Exact => {
+                            exact = true;
+                            break;
+                        }
+                        RuleIdMatch::Stale => {
+                            stale_target = Some(rule_id.clone());
+                        }
+                        RuleIdMatch::NoMatch => {}
+                    }
+                }
+
+                if exact {
+                    continue;
+                }
+
+                if let Some(current_rule_id) = stale_target {
+                    let mut message = String::from(STALE_IMPLEMENTATION_MUST_CHANGE_PREFIX);
+                    if let Some(current_rule) = rules_by_id.get(&current_rule_id) {
+                        message.push_str(&format!(
+                            ". Reference '{}' is stale; current rule is '{}'.",
+                            req_id, current_rule.id
+                        ));
+                    } else {
+                        message.push_str(". The referenced annotation is stale, but the latest matching rule could not be loaded.");
+                    }
+                    diagnostics.push(LspDiagnostic {
+                        severity: "warning".to_string(),
+                        code: "stale".to_string(),
+                        message,
+                        start_line,
+                        start_char,
+                        end_line,
+                        end_char,
+                    });
+                } else {
+                    let suggestions = suggest_similar_rule_ids(&req_id, known_for_prefix, 3);
+                    let message = if suggestions.is_empty() {
+                        format!("Reference to unknown rule '{req_id}'")
+                    } else {
+                        format!(
+                            "Reference to unknown rule '{}' (did you mean: {})",
+                            req_id,
+                            suggestions
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    diagnostics.push(LspDiagnostic {
+                        severity: "warning".to_string(),
+                        code: "orphaned".to_string(),
+                        message,
+                        start_line,
+                        start_char,
+                        end_line,
+                        end_char,
+                    });
+                }
+            }
+        }
+
+        if !diagnostics.is_empty() {
+            let rel_path = path
+                .strip_prefix(abs_root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| compute_relative_path(abs_root, path));
+            out.push(LspFileDiagnostics {
+                path: rel_path,
+                diagnostics,
+            });
+        }
+    }
+
     out
 }
 
@@ -2143,6 +2359,7 @@ pub async fn build_dashboard_data_with_overlay(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_dashboard_data_with_overlay_and_cache(
     project_root: &Path,
     config_path: &Path,
@@ -2171,6 +2388,7 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
     let specs_content_by_impl: BTreeMap<ImplKey, ApiSpecData> = BTreeMap::new();
     let mut spec_includes_by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut all_file_contents: BTreeMap<PathBuf, String> = BTreeMap::new();
+    let mut all_spec_file_contents: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut all_source_reqs_by_file: BTreeMap<PathBuf, Reqs> = BTreeMap::new();
     let mut all_search_rules: Vec<search::RuleEntry> = Vec::new();
     let mut total_extracted_rules = 0usize;
@@ -2277,17 +2495,27 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
                 include_patterns
             );
         }
-        let (extracted_rules, spec_walk_full_scan) = load_rules_from_includes_cached(
-            project_root,
-            &include_patterns,
-            overlay,
-            cache,
-            quiet,
-            changed_files,
-            &mut cache_stats,
-        )
-        .await?;
+        let (extracted_rules, spec_file_paths, spec_walk_full_scan) =
+            load_rules_from_includes_cached(
+                project_root,
+                &include_patterns,
+                overlay,
+                cache,
+                quiet,
+                changed_files,
+                &mut cache_stats,
+            )
+            .await?;
         total_extracted_rules += extracted_rules.len();
+
+        // Collect spec file contents for workspace diagnostics
+        for spec_path in &spec_file_paths {
+            if !all_spec_file_contents.contains_key(spec_path)
+                && let Ok(content) = read_file_with_overlay(spec_path, overlay).await
+            {
+                all_spec_file_contents.insert(spec_path.clone(), content);
+            }
+        }
 
         let unique_prefixes: BTreeSet<String> =
             extracted_rules.iter().map(|r| r.prefix.clone()).collect();
@@ -2571,9 +2799,11 @@ pub async fn build_dashboard_data_with_overlay_and_cache(
         &forward_by_impl,
         &all_source_reqs_by_file,
         &all_file_contents,
+        &all_spec_file_contents,
         &test_files,
         &include_parse_failures,
-    );
+    )
+    .await;
 
     let elapsed = build_start.elapsed();
     info!(

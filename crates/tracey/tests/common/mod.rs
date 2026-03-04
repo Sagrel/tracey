@@ -3,49 +3,55 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
-use tokio::task::JoinHandle;
+use std::sync::Once;
 
-use roam_memory::memory_transport_pair;
-use roam_stream::{
-    ConnectionHandle, HandshakeConfig, NoDispatcher, accept_framed, initiate_framed,
-};
+use roam_core::memory_link_pair as memory_transport_pair;
 use tracey_proto::{TraceyDaemonClient, TraceyDaemonDispatcher};
+use tracing::debug;
+use tracing_subscriber::EnvFilter;
 
-pub struct RpcTestService {
-    pub client: TraceyDaemonClient<ConnectionHandle>,
-    driver_tasks: Vec<JoinHandle<()>>,
+static TEST_TRACING: Once = Once::new();
+
+pub fn init_test_tracing() {
+    TEST_TRACING.call_once(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,tracey::daemon=debug,tracey::daemon::client=debug")
+        });
+        if let Err(e) = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init()
+        {
+            eprintln!("tracey test tracing init skipped: {e}");
+        } else {
+            eprintln!("tracey test tracing initialized");
+        }
+    });
 }
 
-impl Drop for RpcTestService {
-    fn drop(&mut self) {
-        for task in &self.driver_tasks {
-            task.abort();
-        }
-    }
+pub struct RpcTestService {
+    pub client: TraceyDaemonClient,
+    _server_client: TraceyDaemonClient,
 }
 
 pub async fn create_test_rpc_service(service: tracey::daemon::TraceyService) -> RpcTestService {
+    init_test_tracing();
+    debug!("create_test_rpc_service: start");
+
     let (client_transport, server_transport) = memory_transport_pair(256);
     let dispatcher = TraceyDaemonDispatcher::new(service);
 
-    let client_fut = initiate_framed(client_transport, HandshakeConfig::default(), NoDispatcher);
-    let server_fut = accept_framed(server_transport, HandshakeConfig::default(), dispatcher);
-    let (client_setup, server_setup) = tokio::try_join!(client_fut, server_fut)
+    let server_fut = roam::acceptor(server_transport).establish::<TraceyDaemonClient>(dispatcher);
+    let client_fut = roam::initiator(client_transport).establish::<TraceyDaemonClient>(());
+    let (server_result, client_result) = tokio::try_join!(server_fut, client_fut)
         .expect("failed to establish in-memory roam transport");
-
-    let (client_handle, _incoming_client, client_driver) = client_setup;
-    let (_server_handle, _incoming_server, server_driver) = server_setup;
-
-    let client_task = tokio::spawn(async move {
-        let _ = client_driver.run().await;
-    });
-    let server_task = tokio::spawn(async move {
-        let _ = server_driver.run().await;
-    });
+    let (server_client, _server_session_handle) = server_result;
+    let (client, _client_session_handle) = client_result;
+    debug!("create_test_rpc_service: server+client established");
 
     RpcTestService {
-        client: TraceyDaemonClient::new(client_handle),
-        driver_tasks: vec![client_task, server_task],
+        client,
+        _server_client: server_client,
     }
 }
 
